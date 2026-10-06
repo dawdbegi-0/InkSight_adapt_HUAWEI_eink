@@ -21,6 +21,11 @@ void epdDisplayDeepClear(const uint8_t *image);
 // Full-screen display with pre-packed 2bpp data (4-color panels)
 void epdDisplay2bpp(const uint8_t *image2bpp);
 
+// A1.1 (JD79665 3.98" 4-color): display a whole frame at a custom resolution.
+// The controller must be driven with at least as many rows as the panel has
+// (>= 600) or it fails to drive every gate, leaving a line in the middle.
+void epdDisplayAt(uint16_t w, uint16_t h, const uint8_t *buf);
+
 // Full-screen display with fast refresh (reduced flashing)
 void epdDisplayFast(const uint8_t *image);
 

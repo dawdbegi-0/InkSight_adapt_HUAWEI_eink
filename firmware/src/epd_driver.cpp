@@ -1,6 +1,18 @@
 #include "epd_driver.h"
 #include "config.h"
 
+// ── A1.1 panel support (3.98" JD79665 4-color, 768x552) ─────────────────────
+// The controller is driven at a gate count that is >= the panel height, while
+// the image stays anchored at the top-left of the 768x552 panel. Driving TRES
+// with exactly 768x552 makes the controller skip one gate row in the middle of
+// the screen (fixed orange line). Driving 600 rows fixes it; the area outside
+// the panel (32 columns right, 48 rows bottom) is padded white and invisible.
+//   jdW/jdH are the *controller* resolution, W/H are the *panel* resolution.
+#if defined(EPD_PANEL_38_JD79665_BWRY)
+static uint16_t jdW = 768;
+static uint16_t jdH = 600;
+#endif
+
 #if defined(EPD_PANEL_42_SSD1683_BW) || defined(EPD_PANEL_42_DKE_RY683) || defined(EPD_PANEL_42_GDEM042F52) || defined(EPD_PANEL_38_JD79665_BWRY)
 
 // ── Software SPI (bit-bang) for 4.2" panels ──
@@ -33,13 +45,19 @@ static bool epdWaitBusy(unsigned long maxMs = 0) {
     unsigned long t0 = millis();
     unsigned long timeoutMs = maxMs > 0 ? maxMs :
 #if defined(EPD_PANEL_38_JD79665_BWRY)
-        180000;
+        40000;
 #elif defined(EPD_PANEL_42_DKE_RY683) || defined(EPD_PANEL_42_GDEM042F52)
         45000;
 #else
         10000;
 #endif
-#if defined(EPD_PANEL_42_DKE_RY683) || defined(EPD_PANEL_42_GDEM042F52) || defined(EPD_PANEL_38_JD79665_BWRY)
+#if defined(EPD_PANEL_38_JD79665_BWRY)
+    // JD79665 datasheet: BUSY_N is LOW while busy ("After display refresh
+    // command, BUSY_N will become 0"). Waiting for HIGH here never waits at
+    // all, so wait for it to assert LOW first, then for it to be released.
+    delay(50);
+    while (digitalRead(PIN_EPD_BUSY) == LOW) {
+#elif defined(EPD_PANEL_42_DKE_RY683) || defined(EPD_PANEL_42_GDEM042F52)
     while (digitalRead(PIN_EPD_BUSY) == LOW) {
 #else
     while (digitalRead(PIN_EPD_BUSY) == HIGH) {
@@ -62,9 +80,9 @@ static void epdReset() {
     digitalWrite(PIN_EPD_RST, LOW);  delay(40);
     digitalWrite(PIN_EPD_RST, HIGH); delay(50);
 #elif defined(EPD_PANEL_38_JD79665_BWRY)
-    digitalWrite(PIN_EPD_RST, HIGH); delay(20);
-    digitalWrite(PIN_EPD_RST, LOW);  delay(2);
-    digitalWrite(PIN_EPD_RST, HIGH); delay(20);
+    delay(20);
+    digitalWrite(PIN_EPD_RST, LOW);  delay(40);
+    digitalWrite(PIN_EPD_RST, HIGH); delay(50);
 #elif defined(EPD_PANEL_42_DKE_RY683)
     digitalWrite(PIN_EPD_RST, LOW);  delay(10);
     digitalWrite(PIN_EPD_RST, HIGH); delay(10);
@@ -101,17 +119,31 @@ static void epdSetFullWindow() {
 
 static void epdSendResolution() {
     epdSendCommand(0x61);
+#if defined(EPD_PANEL_38_JD79665_BWRY)
+    // A1.1: drive the controller at the (larger) gate resolution, not the
+    // 768x552 panel size, otherwise one gate row in the middle is skipped.
+    epdSendData((jdW >> 8) & 0xFF);
+    epdSendData(jdW & 0xFF);
+    epdSendData((jdH >> 8) & 0xFF);
+    epdSendData(jdH & 0xFF);
+#else
     epdSendData((W >> 8) & 0xFF);
     epdSendData(W & 0xFF);
     epdSendData((H >> 8) & 0xFF);
     epdSendData(H & 0xFF);
+#endif
 }
 
 static void epdSetJd796xxFullWindow() {
     uint16_t x0 = 0;
-    uint16_t x1 = (uint16_t)(W - 1);
     uint16_t y0 = 0;
+#if defined(EPD_PANEL_38_JD79665_BWRY)
+    uint16_t x1 = (uint16_t)(jdW - 1);
+    uint16_t y1 = (uint16_t)(jdH - 1);
+#else
+    uint16_t x1 = (uint16_t)(W - 1);
     uint16_t y1 = (uint16_t)(H - 1);
+#endif
 
     epdSendCommand(0x83);
     epdSendData((x0 >> 8) & 0xFF);
@@ -122,7 +154,11 @@ static void epdSetJd796xxFullWindow() {
     epdSendData(y0 & 0xFF);
     epdSendData((y1 >> 8) & 0xFF);
     epdSendData(y1 & 0xFF);
+#if defined(EPD_PANEL_38_JD79665_BWRY)
+    epdSendData(0x00);   // PMODE=0: full refresh must not use partial mode
+#else
     epdSendData(0x01);
+#endif
 }
 
 // ── GPIO initialization ─────────────────────────────────────
@@ -236,8 +272,7 @@ void epdInit() {
 #elif defined(EPD_PANEL_38_JD79665_BWRY)
     epdReset();
     Serial.printf("[EPD-init] JD79665 768x552 BUSY=%d\n", digitalRead(PIN_EPD_BUSY));
-    epdWaitBusy();
-    delay(30);
+    delay(300);
 
     epdSendCommand(0xAA);
     epdSendData(0x49);
@@ -304,7 +339,7 @@ void epdInit() {
 
     epdSetJd796xxFullWindow();
     epdSendCommand(0x04);
-    epdWaitBusy();
+    delay(300);   // PON stays before writing RAM; moving it later greys the image
 #else
     epdReset();
     epdWaitBusy();
@@ -447,6 +482,42 @@ static uint8_t epdRemap2bppColor(uint8_t color) {
 }
 
 static void epdWriteMapped2bpp(const uint8_t *buf2bpp) {
+#if defined(EPD_PANEL_38_JD79665_BWRY)
+    // ── A1.1: send jdH rows of jdW pixels, padding outside the panel white ──
+    // The controller RAM window is jdW x jdH (e.g. 768x600), while the source
+    // frame is only W x H (768x552). Each controller row is srcRow bytes of
+    // image followed by white padding, and any rows below the panel are white.
+    epdSendCommand(0x10);
+
+    const int srcRow = W / 4;      // source row width: 768/4 = 192 bytes
+    const int dstRow = jdW / 4;    // controller row width: 768/4 = 192 bytes
+    const uint8_t pad = 0x55;      // white in 2bpp (00=black, 01=white)
+
+    // Hold DC high / CS low for the whole frame instead of toggling per byte.
+    digitalWrite(PIN_EPD_DC, HIGH);
+    digitalWrite(PIN_EPD_CS, LOW);
+
+    for (int y = 0; y < (int)jdH; y++) {
+        if (y < H) {
+            const uint8_t *p = buf2bpp + (size_t)y * srcRow;
+            for (int i = 0; i < srcRow; i++) {
+                uint8_t src = p[i];
+                uint8_t dst = 0;
+                dst |= epdRemap2bppColor((src >> 6) & 0x03) << 6;
+                dst |= epdRemap2bppColor((src >> 4) & 0x03) << 4;
+                dst |= epdRemap2bppColor((src >> 2) & 0x03) << 2;
+                dst |= epdRemap2bppColor(src & 0x03);
+                spiWriteByte(dst);
+            }
+        }
+        // Pad the rest of the row (right of the panel) and all rows below it.
+        for (int i = (y < H ? srcRow : 0); i < dstRow; i++) {
+            spiWriteByte(pad);
+        }
+    }
+
+    digitalWrite(PIN_EPD_CS, HIGH);
+#else
     epdSendCommand(0x10);
     for (int i = 0; i < COLOR_BUF_LEN; i++) {
         uint8_t src = buf2bpp[i];
@@ -457,6 +528,29 @@ static void epdWriteMapped2bpp(const uint8_t *buf2bpp) {
         dst |= epdRemap2bppColor(src & 0x03);
         epdSendData(dst);
     }
+#endif
+}
+
+// Write count identical 2bpp bytes (whole-screen solid colour at any resolution).
+static void epdWriteUniform(uint32_t count, uint8_t v) {
+    epdSendCommand(0x10);
+    digitalWrite(PIN_EPD_DC, HIGH);
+    digitalWrite(PIN_EPD_CS, LOW);
+    for (uint32_t i = 0; i < count; i++) {
+        spiWriteByte(v);
+    }
+    digitalWrite(PIN_EPD_CS, HIGH);
+}
+
+// Write an arbitrary-length 2bpp buffer (whole frame at a custom resolution).
+static void epdWriteBuffer(const uint8_t *buf, uint32_t count) {
+    epdSendCommand(0x10);
+    digitalWrite(PIN_EPD_DC, HIGH);
+    digitalWrite(PIN_EPD_CS, LOW);
+    for (uint32_t i = 0; i < count; i++) {
+        spiWriteByte(buf[i]);
+    }
+    digitalWrite(PIN_EPD_CS, HIGH);
 }
 
 static void epdPowerOff() {
@@ -471,13 +565,13 @@ static void epdJd796xxRefresh() {
     epdSendData(0x00);
 
     unsigned long t0 = millis();
-    bool busyOk = epdWaitBusy(180000);
+    bool busyOk = epdWaitBusy(40000);
     unsigned long elapsed = millis() - t0;
     if (!busyOk) {
         Serial.printf("[EPD] JD79665 refresh BUSY timeout after %lums\n", elapsed);
     } else if (elapsed < 250) {
         Serial.printf("[EPD] JD79665 refresh BUSY only %lums, fallback wait\n", elapsed);
-        delay(14000);
+        delay(22000);   // full refresh takes ~15s; wait it out to avoid ghosting
     } else {
         delay(500);
     }
@@ -581,6 +675,26 @@ void epdDisplay2bpp(const uint8_t *image2bpp) {
 // ── EPD deep clear (multi-cycle anti-ghosting) ──────────────
 // SSD1683 BW: cycles all-black/all-white via 0x24/0x26 registers.
 // 4-color panels: falls back to epdDisplay (no register-level deep clear).
+
+// A1.1: display a whole frame at a custom controller resolution. Passing a row
+// count >= the panel height (e.g. 768x600) drives every gate and removes the
+// fixed middle line seen when the controller is driven at exactly 768x552.
+void epdDisplayAt(uint16_t w, uint16_t h, const uint8_t *buf) {
+#if defined(EPD_PANEL_38_JD79665_BWRY)
+    Serial.printf("[EPD] display at %ux%u (%lu bytes)\n",
+                  w, h, (unsigned long)h * (w / 4));
+    jdW = w;
+    jdH = h;
+    epdInit();
+    epdWriteBuffer(buf, (uint32_t)h * (w / 4));
+    epdJd796xxRefresh();
+    jdW = 768;
+    jdH = 600;
+    Serial.println("[EPD] display at custom res done");
+#else
+    (void)w; (void)h; (void)buf;
+#endif
+}
 
 void epdDisplayDeepClear(const uint8_t *image) {
 #if defined(EPD_PANEL_42_DKE_RY683) || defined(EPD_PANEL_42_GDEM042F52) || defined(EPD_PANEL_38_JD79665_BWRY)
